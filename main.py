@@ -1,22 +1,21 @@
 """
-Media Downloader Bot
----------------------
+Media Downloader Bot (Optimallashtirilgan va Xavfsiz Versiya)
+------------------------------------------------------------
 Instagram Reels va TikTok videolarini watermark'siz yuklab beruvchi Telegram bot.
 
-Funksiyalar:
-- Kuniga 3 ta bepul yuklash limiti
-- Telegram Stars orqali 75 ⭐ ga 1 oylik cheksiz (Premium) obuna
-- SQLite baza (foydalanuvchi ID, kunlik yuklamalar soni, sana, premium status)
-
-Muallif: siz uchun tayyorlandi.
+Tuzatishlar:
+- Temp fayllar diskni to'ldirib yubormasligi uchun avtomatik tozalash funksiyasi mukammallashtirildi.
+- Video, MP3 va Video Note fayllari xavfsiz o'chirilishi ta'minlandi.
 """
 
 import asyncio
 import logging
 import os
 import re
+import shutil
 import sqlite3
 import tempfile
+import uuid
 from datetime import datetime, timedelta
 
 import yt_dlp
@@ -27,6 +26,7 @@ from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message,
+    CallbackQuery,
     PreCheckoutQuery,
     LabeledPrice,
     InlineKeyboardMarkup,
@@ -36,26 +36,26 @@ from aiogram.types import (
 from dotenv import load_dotenv
 
 # ============================================================
-# SOZLAMALAR (Replit Secrets / .env dan olinadi)
+# SOZLAMALAR
 # ============================================================
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-STARS_PROVIDER_TOKEN = os.getenv("STARS_PROVIDER_TOKEN", "")  # Stars uchun odatda "" bo'ladi
+STARS_PROVIDER_TOKEN = os.getenv("STARS_PROVIDER_TOKEN", "")
 DB_PATH = os.getenv("DB_PATH", "bot_database.db")
 
 DAILY_FREE_LIMIT = 3
 PREMIUM_PRICE_STARS = 75
 PREMIUM_DAYS = 30
+ACTIVE_FILE_TTL_MINUTES = 20
 
-# Render "Web Service" turida ishlatilganda platforma shu portni kutadi.
-# Agar Render'da "Background Worker" turida joylashtirsangiz, bu ishlatilmaydi.
+VIDEO_NOTE_SIZE = 384
+VIDEO_NOTE_MAX_SECONDS = 60
+
 PORT = int(os.getenv("PORT", "10000"))
 
 if not BOT_TOKEN:
-    raise RuntimeError(
-        "BOT_TOKEN topilmadi! Replit 'Secrets' bo'limiga BOT_TOKEN qo'shing."
-    )
+    raise RuntimeError("BOT_TOKEN topilmadi! Replit Secrets'ga BOT_TOKEN qo'shing.")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -69,6 +69,13 @@ URL_REGEX = re.compile(
     r"(https?://(?:www\.|vt\.|vm\.)?(?:instagram\.com|tiktok\.com)\S+)",
     re.IGNORECASE,
 )
+
+# ============================================================
+# XOTIRADAGI KESHLAR
+# ============================================================
+pending_urls: dict[str, dict] = {}
+active_files: dict[str, dict] = {}
+
 
 # ============================================================
 # DATABASE (SQLite)
@@ -145,7 +152,6 @@ def is_premium_active(user_id: int) -> bool:
         return False
     premium_until = datetime.strptime(row["premium_until"], "%Y-%m-%d %H:%M:%S")
     if premium_until < datetime.now():
-        # muddati tugagan — premium'ni o'chiramiz
         conn = db_connect()
         cur = conn.cursor()
         cur.execute(
@@ -196,23 +202,26 @@ def activate_premium(user_id: int):
 # ============================================================
 # YT-DLP YORDAMIDA YUKLASH
 # ============================================================
-def _download_video_sync(url: str, out_dir: str) -> str:
-    """Sinxron (blocking) yuklash funksiyasi — thread ichida chaqiriladi."""
+QUALITY_FORMATS = {
+    "360": "bestvideo[height<=360]+bestaudio/best[height<=360]/best",
+    "720": "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
+    "1080": "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
+}
+
+
+def _download_video_sync(url: str, out_dir: str, quality: str) -> str:
     output_template = os.path.join(out_dir, "%(id)s.%(ext)s")
     ydl_opts = {
         "outtmpl": output_template,
-        "format": "mp4/bestvideo+bestaudio/best",
+        "format": QUALITY_FORMATS.get(quality, "mp4/bestvideo+bestaudio/best"),
         "merge_output_format": "mp4",
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        # TikTok/Instagram odatda watermark'siz to'g'ridan-to'g'ri video
-        # manbasini beradi — yt-dlp shu manbadan yuklaydi.
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         filename = ydl.prepare_filename(info)
-        # merge_output_format tufayli kengaytma .mp4 bo'lishi kerak
         if not filename.endswith(".mp4"):
             base, _ = os.path.splitext(filename)
             mp4_path = base + ".mp4"
@@ -221,12 +230,62 @@ def _download_video_sync(url: str, out_dir: str) -> str:
         return filename
 
 
-async def download_video(url: str) -> str:
-    """Asosiy event loop'ni bloklamaslik uchun thread'da ishga tushiriladi."""
+async def download_video(url: str, quality: str = "720") -> tuple[str, str]:
     tmp_dir = tempfile.mkdtemp(prefix="mediabot_")
     loop = asyncio.get_running_loop()
-    file_path = await loop.run_in_executor(None, _download_video_sync, url, tmp_dir)
-    return file_path
+    file_path = await loop.run_in_executor(
+        None, _download_video_sync, url, tmp_dir, quality
+    )
+    return file_path, tmp_dir
+
+
+# ============================================================
+# FFMPEG YORDAMIDA MP3 VA VIDEO NOTE HOSIL QILISH
+# ============================================================
+async def extract_audio(video_path: str) -> str:
+    out_path = os.path.splitext(video_path)[0] + f"_{uuid.uuid4().hex[:6]}.mp3"
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", video_path,
+        "-vn",
+        "-acodec", "libmp3lame",
+        "-q:a", "2",
+        out_path,
+    ]
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await process.communicate()
+    if process.returncode != 0:
+        raise RuntimeError(f"ffmpeg (mp3) xatolik: {stderr.decode(errors='ignore')[-500:]}")
+    return out_path
+
+
+async def make_video_note(video_path: str) -> str:
+    out_path = os.path.splitext(video_path)[0] + f"_note_{uuid.uuid4().hex[:6]}.mp4"
+    vf = f"crop='min(iw,ih)':'min(iw,ih)',scale={VIDEO_NOTE_SIZE}:{VIDEO_NOTE_SIZE}"
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", video_path,
+        "-t", str(VIDEO_NOTE_MAX_SECONDS),
+        "-vf", vf,
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        out_path,
+    ]
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await process.communicate()
+    if process.returncode != 0:
+        raise RuntimeError(f"ffmpeg (video note) xatolik: {stderr.decode(errors='ignore')[-500:]}")
+    return out_path
 
 
 # ============================================================
@@ -245,6 +304,39 @@ def premium_offer_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def quality_keyboard(token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="360p", callback_data=f"q:{token}:360"),
+                InlineKeyboardButton(text="720p", callback_data=f"q:{token}:720"),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="1080p (⭐ Premium)", callback_data=f"q:{token}:1080"
+                )
+            ],
+        ]
+    )
+
+
+def post_download_keyboard(token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🎵 MP3 shaklida yuklash", callback_data=f"mp3:{token}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📹 Dumaloq video qilish", callback_data=f"vnote:{token}"
+                )
+            ],
+        ]
+    )
+
+
 # ============================================================
 # HANDLERLAR
 # ============================================================
@@ -253,9 +345,11 @@ async def cmd_start(message: Message):
     await message.answer(
         "👋 Salom! Men <b>Media Downloader Bot</b>man.\n\n"
         "📥 Menga Instagram Reels yoki TikTok havolasini yuboring — "
-        "videoni watermark'siz yuklab beraman.\n\n"
-        f"🎁 Kuniga <b>{DAILY_FREE_LIMIT} ta</b> bepul yuklash mavjud.\n"
-        f"⭐ Cheksiz yuklash uchun <b>{PREMIUM_PRICE_STARS} Stars</b>ga "
+        "video sifatini tanlaysiz va men uni watermark'siz yuklab beraman.\n\n"
+        "🎵 Har bir video ostida MP3 shaklida yuklab olish imkoniyati bor.\n"
+        "📹 Video ostida uni dumaloq video (video note) shakliga o'tkazish imkoniyati ham bor.\n\n"
+        f"🎁 Kuniga <b>{DAILY_FREE_LIMIT} ta</b> bepul yuklash mavjud (360p/720p).\n"
+        f"⭐ 1080p sifat va cheksiz yuklash uchun <b>{PREMIUM_PRICE_STARS} Stars</b>ga "
         "1 oylik Premium sotib olishingiz mumkin — /premium buyrug'i orqali."
     )
 
@@ -269,7 +363,7 @@ async def cmd_premium(message: Message):
         return
     await message.answer(
         f"⭐ <b>Premium obuna — {PREMIUM_PRICE_STARS} Stars / 1 oy</b>\n\n"
-        "Premium bilan siz cheksiz miqdorda video yuklashingiz mumkin bo'ladi.",
+        "Premium bilan siz cheksiz miqdorda va 1080p sifatda video yuklashingiz mumkin bo'ladi.",
         reply_markup=premium_offer_keyboard(),
     )
 
@@ -282,9 +376,7 @@ async def cmd_status(message: Message):
     if is_premium_active(user_id):
         conn = db_connect()
         cur = conn.cursor()
-        cur.execute(
-            "SELECT premium_until FROM users WHERE user_id = ?", (user_id,)
-        )
+        cur.execute("SELECT premium_until FROM users WHERE user_id = ?", (user_id,))
         until = cur.fetchone()["premium_until"]
         conn.close()
         await message.answer(f"⭐ Sizda faol Premium bor.\nMuddati: <b>{until}</b>")
@@ -297,16 +389,12 @@ async def cmd_status(message: Message):
 
 
 @router.callback_query(F.data == "buy_premium")
-async def process_buy_premium(callback):
+async def process_buy_premium(callback: CallbackQuery):
     await bot.send_invoice(
         chat_id=callback.from_user.id,
         title="Premium obuna (1 oy)",
-        description=(
-            f"Cheksiz video yuklash uchun {PREMIUM_DAYS} kunlik Premium obuna."
-        ),
+        description=f"Cheksiz video yuklash va 1080p sifat uchun {PREMIUM_DAYS} kunlik Premium obuna.",
         payload=f"premium_{callback.from_user.id}",
-        # Telegram Stars uchun provider_token BO'SH bo'lishi kerak,
-        # currency esa har doim "XTR" bo'ladi.
         provider_token=STARS_PROVIDER_TOKEN,
         currency="XTR",
         prices=[LabeledPrice(label="Premium (1 oy)", amount=PREMIUM_PRICE_STARS)],
@@ -316,7 +404,6 @@ async def process_buy_premium(callback):
 
 @router.pre_checkout_query()
 async def process_pre_checkout_query(pre_checkout_query: PreCheckoutQuery):
-    # To'lovni tasdiqlaymiz
     await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
 
 
@@ -329,7 +416,7 @@ async def process_successful_payment(message: Message):
         "🎉 To'lov muvaffaqiyatli o'tdi!\n"
         f"✅ Sizga <b>Premium</b> status berildi.\n"
         f"📅 Amal qilish muddati: <b>{premium_until}</b> gacha.\n\n"
-        "Endi cheksiz video yuklashingiz mumkin!"
+        "Endi cheksiz va 1080p sifatda video yuklashingiz mumkin!"
     )
 
 
@@ -342,12 +429,59 @@ async def handle_link(message: Message):
     match = URL_REGEX.search(message.text)
     url = match.group(1) if match else message.text.strip()
 
+    token = uuid.uuid4().hex[:10]
+    pending_urls[token] = {
+        "url": url,
+        "user_id": user_id,
+        "created": datetime.now(),
+    }
+
+    await message.answer(
+        "🎬 Video sifatini tanlang:",
+        reply_markup=quality_keyboard(token),
+    )
+
+
+@router.callback_query(F.data.startswith("q:"))
+async def process_quality_choice(callback: CallbackQuery):
+    try:
+        _, token, quality = callback.data.split(":")
+    except ValueError:
+        await callback.answer("Xatolik yuz berdi.", show_alert=True)
+        return
+
+    data = pending_urls.get(token)
+    if not data:
+        await callback.answer(
+            "⏰ Bu so'rov eskirgan. Iltimos, havolani qaytadan yuboring.",
+            show_alert=True,
+        )
+        return
+
+    user_id = callback.from_user.id
+    if data["user_id"] != user_id:
+        await callback.answer("Bu tugma sizga tegishli emas.", show_alert=True)
+        return
+
+    url = data["url"]
     premium = is_premium_active(user_id)
 
+    if quality == "1080" and not premium:
+        await callback.answer()
+        await callback.message.edit_text(
+            "🔒 1080p sifat faqat <b>Premium</b> foydalanuvchilar uchun.\n\n"
+            f"⭐ {PREMIUM_PRICE_STARS} Stars evaziga Premium sotib olib, "
+            "1080p sifatda va cheksiz yuklashdan foydalanishingiz mumkin:",
+            reply_markup=premium_offer_keyboard(),
+        )
+        return
+
     if not premium:
+        reset_if_new_day(user_id)
         used = get_downloads_today(user_id)
         if used >= DAILY_FREE_LIMIT:
-            await message.answer(
+            await callback.answer()
+            await callback.message.edit_text(
                 "🚫 Bugungi bepul limitingiz tugadi "
                 f"({DAILY_FREE_LIMIT}/{DAILY_FREE_LIMIT}).\n\n"
                 f"⭐ Cheksiz yuklash uchun {PREMIUM_PRICE_STARS} Starsga "
@@ -356,30 +490,114 @@ async def handle_link(message: Message):
             )
             return
 
-    status_msg = await message.answer("⏳ Video yuklanmoqda, biroz kuting...")
+    await callback.answer()
+    await callback.message.edit_text(
+        f"⏳ {quality}p sifatida video yuklanmoqda, biroz kuting..."
+    )
 
     file_path = None
+    tmp_dir = None
     try:
-        file_path = await download_video(url)
+        file_path, tmp_dir = await download_video(url, quality)
+        active_files[token] = {
+            "path": file_path,
+            "dir": tmp_dir,
+            "user_id": user_id,
+            "created": datetime.now(),
+        }
         video_file = FSInputFile(file_path)
-        await message.answer_video(
+        await callback.message.answer_video(
             video=video_file,
-            caption="✅ Mana, so'ragan videongiz (watermark'siz).",
+            caption=f"✅ Mana, so'ragan videongiz ({quality}p, watermark'siz).",
+            reply_markup=post_download_keyboard(token),
         )
+        await callback.message.delete()
         if not premium:
             increment_download(user_id)
     except Exception as e:
         logger.exception("Yuklashda xatolik: %s", e)
-        await message.answer(
+        await callback.message.edit_text(
             "❌ Videoni yuklab bo'lmadi. Havola noto'g'ri yoki video "
             "yopiq/o'chirilgan bo'lishi mumkin. Boshqa havola bilan urinib ko'ring."
         )
+        if tmp_dir and os.path.exists(tmp_dir):
+            shutil.rmtree(tmp_dir, ignore_errors=True)
     finally:
-        await status_msg.delete()
-        if file_path and os.path.exists(file_path):
+        pending_urls.pop(token, None)
+
+
+@router.callback_query(F.data.startswith("mp3:"))
+async def process_mp3_request(callback: CallbackQuery):
+    token = callback.data.split(":", 1)[1]
+    entry = active_files.get(token)
+
+    if not entry or not os.path.exists(entry["path"]):
+        await callback.answer(
+            "⏰ Fayl muddati tugagan. Videoni qaytadan yuklab, urinib ko'ring.",
+            show_alert=True,
+        )
+        return
+    if entry["user_id"] != callback.from_user.id:
+        await callback.answer("Bu tugma sizga tegishli emas.", show_alert=True)
+        return
+
+    await callback.answer("🎵 Audio ajratilmoqda...")
+
+    mp3_path = None
+    try:
+        mp3_path = await extract_audio(entry["path"])
+        audio_file = FSInputFile(mp3_path)
+        await callback.message.answer_audio(
+            audio=audio_file,
+            caption="🎵 Audio (MP3) fayl tayyor.",
+        )
+    except Exception as e:
+        logger.exception("MP3 ajratishda xatolik: %s", e)
+        await callback.message.answer(
+            "❌ Audio ajratib bo'lmadi. Qaytadan urinib ko'ring."
+        )
+    finally:
+        if mp3_path and os.path.exists(mp3_path):
             try:
-                os.remove(file_path)
-                os.rmdir(os.path.dirname(file_path))
+                os.remove(mp3_path)
+            except OSError:
+                pass
+
+
+@router.callback_query(F.data.startswith("vnote:"))
+async def process_video_note_request(callback: CallbackQuery):
+    token = callback.data.split(":", 1)[1]
+    entry = active_files.get(token)
+
+    if not entry or not os.path.exists(entry["path"]):
+        await callback.answer(
+            "⏰ Fayl muddati tugagan. Videoni qaytadan yuklab, urinib ko'ring.",
+            show_alert=True,
+        )
+        return
+    if entry["user_id"] != callback.from_user.id:
+        await callback.answer("Bu tugma sizga tegishli emas.", show_alert=True)
+        return
+
+    await callback.answer("📹 Dumaloq video tayyorlanmoqda...")
+
+    vnote_path = None
+    try:
+        vnote_path = await make_video_note(entry["path"])
+        vnote_file = FSInputFile(vnote_path)
+        await callback.message.answer_video_note(
+            video_note=vnote_file,
+            length=VIDEO_NOTE_SIZE,
+        )
+    except Exception as e:
+        logger.exception("Video note qilishda xatolik: %s", e)
+        await callback.message.answer(
+            "❌ Dumaloq video tayyorlab bo'lmadi. Qaytadan urinib ko'ring."
+        )
+    finally:
+        if vnote_path and os.path.exists(vnote_path):
+            try:
+                os.remove(vnote_path)
             except OSError:
                 pass
 
@@ -393,12 +611,40 @@ async def handle_other_text(message: Message):
 
 
 # ============================================================
-# RENDER UCHUN HEALTH-CHECK WEB SERVER
+# ESKIRGAN FAYLLARNI TOZALASH (Disk to'lib qolmasligi uchun)
 # ============================================================
-# Render "Web Service" turi doim ochiq port kutadi, aks holda
-# "no open ports detected" xatosi bilan deploy muvaffaqiyatsiz tugaydi.
-# Agar botni "Background Worker" turida joylashtirsangiz, bu server
-# shart emas, lekin uni ishga tushirish hech qanday zarar keltirmaydi.
+async def cleanup_expired_cache_loop():
+    while True:
+        await asyncio.sleep(300)
+        now = datetime.now()
+
+        expired_files = [
+            t
+            for t, e in active_files.items()
+            if now - e["created"] > timedelta(minutes=ACTIVE_FILE_TTL_MINUTES)
+        ]
+        for t in expired_files:
+            entry = active_files.pop(t, None)
+            if entry:
+                tmp_dir = entry.get("dir")
+                if tmp_dir and os.path.exists(tmp_dir):
+                    try:
+                        shutil.rmtree(tmp_dir, ignore_errors=True)
+                    except OSError:
+                        pass
+
+        expired_pending = [
+            t
+            for t, e in pending_urls.items()
+            if now - e["created"] > timedelta(minutes=ACTIVE_FILE_TTL_MINUTES)
+        ]
+        for t in expired_pending:
+            pending_urls.pop(t, None)
+
+
+# ============================================================
+# HEALTH-CHECK SERVER
+# ============================================================
 async def handle_health_check(request: web.Request) -> web.Response:
     return web.Response(text="Bot ishlab turibdi ✅")
 
@@ -421,10 +667,10 @@ async def main():
     logger.info("Bot ishga tushmoqda...")
     await bot.delete_webhook(drop_pending_updates=True)
 
-    # Web server va bot pollingini bir vaqtda, parallel ishga tushiramiz.
     await asyncio.gather(
         start_web_server(),
         dp.start_polling(bot),
+        cleanup_expired_cache_loop(),
     )
 
 
